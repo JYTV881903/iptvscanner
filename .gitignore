@@ -1,0 +1,4 @@
+__pycache__/
+channels.json
+channels.m3u
+*.tmp
