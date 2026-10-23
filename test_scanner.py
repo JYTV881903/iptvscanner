@@ -27,7 +27,7 @@ class FakeCapture:
         return self.reader.fileno()
 
     def recv(self):
-        return self.reader.recv(512)
+        return self.reader.recv(65535)
 
     def drops(self):
         return 0
@@ -81,6 +81,9 @@ class ScannerTests(unittest.TestCase):
             crafted = bytearray(packet())
             sender.sendto(bytes(crafted[8:]), receiver.getsockname())
             self.assertTrue(receiver.recv(512))
+            large = packet(payload=bytes(1300))[8:]
+            sender.sendto(large, receiver.getsockname())
+            self.assertEqual(receiver.recv(65535), large)
             crafted[9] = 6
             sender.sendto(bytes(crafted[8:]), receiver.getsockname())
             with self.assertRaises(socket.timeout):
@@ -130,7 +133,7 @@ class ScannerTests(unittest.TestCase):
             return member
         try:
             with tempfile.TemporaryDirectory() as directory:
-                args = argparse.Namespace(passes=2, concurrency=2, wait=.03, rate=1000,
+                args = argparse.Namespace(passes=2, concurrency=2, wait=.03, rate=1000, cooldown=.01,
                                           output=directory + '/channels', interface='fake0',
                                           ranges=['239.1.2.1-239.1.2.3'])
                 with contextlib.redirect_stderr(io.StringIO()):

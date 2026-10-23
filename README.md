@@ -1,83 +1,100 @@
-# iptvscanner
+# iptvscanner — NOWTV / Linux 組播盲掃
 
-Linux IPv4 UDP 組播盲掃工具，適合在 Ubuntu 26.04 的 IPTV 接收介面執行。
-不需要知道 UDP 埠號，也不需要掃描 65535 個埠。工具透過 IGMP 加入組播群組，
-持續擷取該介面收到的 IPv4 UDP 封包，自動記錄目的 IP、埠及第一個來源 IP。
+適合 Ubuntu 26.04 的 IPv4 UDP 組播掃描器。不需要知道 UDP 埠，透過 IGMP 訂閱群組，
+擷取目的 IP 與埠。僅使用 Python 3 標準函式庫。
 
-使用 Python 3 標準函式庫，沒有 pip 依賴。這是新實作，未複製 Windows 參考專案的程式碼。
+## NOWTV 四台限制
 
-## 在你的 Ubuntu 上執行
+**舊版的高並行參數不適用於 NOWTV，可能漏掃。請重新下載此版本。**
+本版預設與上限均為同時 4 個群組，預設觀察 5 秒；每次退組後暫停新加入 2 秒，
+讓上游有機會釋放名額。退組不保證即時完成；仍漏掃時提高 `--cooldown` 或降低 `-c`。
+程式只能限制自己的群組數，不能查看 ISP 已使用的名額。
 
-網卡必須已接到可接收 IPTV 的 ISP 網路，具有 IPv4 位址。
-工具不會替你設定 VLAN、DHCP、路由或 ISP 認證。需要 VLAN 時請指定 VLAN 子介面。
-以下命令在儲存庫目錄執行。原始封包擷取需要 root 或 CAP_NET_RAW。
+掃描前關閉其他播放器與機頂盒接收。若仍有一台播放，最多使用 `-c 3`，
+也要留意其他電腦或同一網卡既有的組播成員。網卡需已連到可接收 IPTV 的 ISP 網路，
+具有 IPv4 位址；工具不會設定 VLAN、認證或路由。需要 VLAN 時指定 VLAN 子介面。
+原始封包擷取需要 root 或 CAP_NET_RAW。
+
+## 已知範圍與 M3U
+
+解壓後進入目錄，**scanner.py 與 services.py 必須放在同一目錄**。
 
 ```bash
-python3 --version
+# 239.255.0.0 到 239.255.7.255，共 2048 個位址。
+sudo python3 scanner.py -i ens256 -r 239.255.0.0/21 -c 4 --wait 5 --cooldown 2 --rate 4 -o /tmp/nowtv
+```
+
+輸出 `/tmp/nowtv.m3u`、`/tmp/nowtv.json`；每 10 秒保存，結束或 Ctrl+C 也會保存。
+同前綴舊結果會被取代，不同掃描請使用不同前綴。強制 kill 或斷電無法保證最後保存。
+這組參數掃完整段約為一小時量級，依加入、退組及收流延遲而變。
+
+漏掃或未取得名稱可用保守參數重新掃描：
+
+```bash
+sudo python3 scanner.py -i ens256 -r 239.255.0.0/21 -c 3 --wait 10 --cooldown 5 --rate 2 --passes 2 -o /tmp/nowtv-recheck
+```
+
+兩輪會合併該次執行的發現，並非讀入舊 M3U。先拿包含已知可播放頻道的小範圍測試，
+確認收流正常後再長時間掃描。無回應不表示一定沒有頻道。
+
+## Service name 命名
+
+解析 UDP MPEG-TS 或 RTP MPEG-TS 中 PID 0x11 的 DVB SDT actual table 及
+service descriptor 0x48，取得 service_id、service name、provider。
+支援跨 TS 封包重組、連續計數檢查、MPEG CRC 驗證。
+擷取完整未分片 UDP 封包，避免 SDT 在 UDP 後段時被截斷。
+
+有名稱時，M3U 格式例如（下列不是實測頻道資料）：
+
+```text
+#EXTM3U
+#EXTINF:-1,NOW News
+#EXTVLCOPT:program=332
+udp://@239.255.1.2:54321
+```
+
+同串流若含多個 service，會輸出多筆名稱，使用 VLC 的 program 選項區分；
+其他播放器不一定支援此選項。JSON 的 stream 內包含 `services` 清單。
+沒有 SDT、觀察時間不足或無法解析時保留 `IP:port`，不猜頻道名稱。
+
+文字支援 ASCII、UTF-8、UTF-16BE、部分 ISO-8859 與 DVB 指定的中韓文字編碼。
+未完整實作預設 ISO-6937 的非 ASCII 字元，無法解碼時以替代字元呈現。
+不做 EPG、OCR、外部名稱查詢或解密。
+
+## 探索未知範圍
+
+```bash
+# 擴大至 239.255.*.*，仍最多四台。
+sudo python3 scanner.py -i ens256 -r 239.255.0.0/16 -o /tmp/nowtv-expanded
+
+# 支援多段 CIDR 或含起訖 IP；重疊地址只計一次。
+sudo python3 scanner.py -i ens256 -r 239.255.0.0/21 -r 239.255.8.0-239.255.15.255 -o /tmp/nowtv-more
+
+# 不連網的地址數與時間下限估計。
+python3 scanner.py -i ens256 -r 239.255.0.0/21 --dry-run
+```
+
+省略 `-r` 代表完整 `224.0.0.0/4`，共 268,435,456 個位址，不是短時間能完成的工作。
+時間估計不含退組冷卻、設備延遲等額外耗時。沒有通用方式向 ISP 列舉所有頻道；
+四台限制不能靠增加執行緒繞過。建議優先探索已知範圍附近，再以長等待複查。
+
+## 診斷與測試
+
+```bash
 ip -s link show dev ens256
-
-# 小範圍功能測試；可換成一段包含已知頻道的網段。
-sudo python3 scanner.py -i ens256 -r 239.0.0.0/24 -c 16 --wait 2 -o /tmp/iptv-check
-
-# 完整 IPv4 組播盲掃，不預先指定 UDP 埠；Ctrl+C 會保存目前結果。
-sudo python3 scanner.py -i ens256 -c 32 --wait 1.5 --rate 64 -o /tmp/iptv-full
-
-# 若 ISP 已知使用 239/8，集中掃這一段可大幅縮短時間。
-sudo python3 scanner.py -i ens256 -r 239.0.0.0/8 -c 32 --wait 1.5 --rate 64 -o /tmp/iptv-239
-
-# 支援多段 CIDR 或含起訖的 IP 範圍；重疊位址只掃一次。
-sudo python3 scanner.py -i ens256 -r 239.1.0.0/16 -r 239.2.1.1-239.2.1.254 \
-  -c 64 --wait 2 --rate 128 --passes 2 -o /tmp/iptv-results
-```
-
-輸出 `<prefix>.json` 和 `<prefix>.m3u`；同名結果會被取代。每 10 秒保存一次，正常結束或
-Ctrl+C 時也會保存。請對不同掃描使用不同輸出前綴。JSON 保留封包數、負載位元組數、
-加入失敗、擷取丟包及掃描完成狀態。M3U 使用 `udp://@IP:port`，初步辨識到 RTP MPEG-TS
-則使用 `rtp://@IP:port`。所有發現項目都是 UDP 串流候選，不保證是可播放電視頻道。
-
-## 掃描速度與完整性的限制
-
-完整 `224.0.0.0/4` 有 **268,435,456** 個位址；`239.0.0.0/8` 有 **16,777,216** 個。
-不是所有位址都能由 ISP 提供或轉送，例如 224.0.0/24 是本地控制範圍。
-沒有通用協定能向 ISP 查詢「所有存在的頻道」，只能逐群組訂閱並等待流量。
-沉默群組也可能受 VLAN、認證、SSM、IGMP 限額、速率限制或啟播延遲影響，不能視為不存在。
-
-執行前可查看不連網的理想時間估計：
-
-```bash
-python3 scanner.py -i ens256 --dry-run -c 32 --wait 1.5 --rate 64
-```
-
-以這組保守參數估計，全 /4 的理想時間約 **146 天**，239/8 約 **9.1 天**。
-這不包含額外延遲，不是實測速度。若已知頻道在小範圍測試中可靠出現，才逐步提高 `-c`
-與 `--rate`，或縮短 `--wait`。並行 64 個 8 Mbps 頻道可能引入約 512 Mbps 流量；
-過高並行數可能超過光貓/交換器的群組上限或造成丟包。
-
-`--wait` 是每個群組加入後的觀察秒數，預設 1.5。程式不會因第一個埠有回應就立即退組，
-以保留發現同組其他埠的機會。`--passes 2` 會完整重掃兩次並合併結果；它增加觀察機會，
-也會倍增掃描時間。無回應不代表一定沒有串流；應用較長等待時間複查重要網段。
-
-程式使用每群組一個加入 socket，避免每個 socket 的組播成員數限制，仍受程序 FD 上限
-及上游設備限制。大量並行時可先看 `ulimit -n`；程式會檢查 FD 預算。
-接收 socket 在開始訂閱前就建立，使用核心 BPF 過濾 UDP 組播，只擷取封包前 512 bytes；
-統計的 payload_bytes 來自 UDP 長度欄位，不是解碼量或完整錄影。
-不處理 IPv4 分片、不加入 IPv6 組播、不做 SSM 來源指定、不解密，也不解析頻道名稱。
-RTP/TS 是啟發式辨識，後續可用 VLC/ffprobe 確認。
-
-如果小範圍測試沒有發現頻道，先將同一範圍換成包含一個已知可播放頻道的網段，
-並提高 `--wait 5`，確認 ISP 連線可用後再開始長時間盲掃。
-`ip -s link show dev ens256` 的 RX dropped 是網卡累計指標；JSON 的 capture_drops
-是此次 packet socket 的核心丟包數，兩者不同。工具不會自動修改網卡或 sysctl。
-
-## 開發與驗證
-
-```bash
+cat /tmp/nowtv.json
 python3 -m unittest -v
 ```
 
-測試涵蓋範圍合併、未知 UDP 埠、IPv4 options、TS/RTP 初判、畸形與分片封包、
-核心 BPF 驗證及過濾、Linux loopback 真實組播加入與收包，及以注入擷取來源驗證的
-並行排程、多輪掃描、輸出、錯誤與中斷清理。
-雲端開發機未必有 CAP_NET_RAW，測試不能替代 Ubuntu 26.04 上的 AF_PACKET 實際抓包
-及你的 ISP 實測。結束碼：0 為掃描迴圈完成且未觀測到加入失敗/擷取丟包；
-2 為加入失敗或擷取丟包；1 為設定/執行錯誤；130 為中斷。0 不代表所有頻道均已發現。
+JSON 記錄加入失敗、擷取丟包、封包數、第一個來源 IP、服務名稱與掃描狀態。
+網卡 RX dropped 是累計指標，和此次 packet socket 的 `capture_drops` 不同。
+`scan_complete` 只表示觀察窗全部完成且未記錄到加入錯誤/擷取丟包，不保證所有頻道均發現。
+不修改網卡、路由或 sysctl；不處理 IPv4 分片、IPv6 或 SSM 指定來源。
+發現的 UDP 流量是候選，TS/RTP 也是初判，不保證能播放。
+
+結束碼：0 表示觀察窗完成且未記錄到加入錯誤/擷取丟包；2 表示加入錯誤或擷取丟包；
+1 為設定/執行錯誤；130 為中斷。
+
+測試含真實 Linux loopback 組播收包、核心 BPF，以及注入擷取來源的排程、冷卻、
+SDT 服務名稱/重組/CRC、輸出與中斷測試。
+雲端開發機缺少 CAP_NET_RAW，也無法連到你的 ISP；尚未在 Ubuntu 26.04/NOWTV 實測。

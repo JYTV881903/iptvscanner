@@ -14,6 +14,7 @@ import socket
 import struct
 import sys
 import time
+from services import ServiceNames
 
 
 def ranges(values):
@@ -90,7 +91,7 @@ def interface_info(name):
 
 
 def attach_filter(sock):
-    # Kernel cBPF: UDP and IPv4 multicast destination; snapshot only 512 bytes.
+    # Full datagrams are required: SDT may follow the first TS packet in UDP.
     class Insn(ctypes.Structure):
         _fields_ = [('code', ctypes.c_ushort), ('jt', ctypes.c_ubyte),
                     ('jf', ctypes.c_ubyte), ('k', ctypes.c_uint32)]
@@ -98,7 +99,7 @@ def attach_filter(sock):
         _fields_ = [('len', ctypes.c_ushort), ('filter', ctypes.POINTER(Insn))]
     code = (Insn * 8)(Insn(0x30, 0, 0, 9), Insn(0x15, 0, 5, 17),
                       Insn(0x20, 0, 0, 16), Insn(0x54, 0, 0, 0xF0000000),
-                      Insn(0x15, 0, 2, 0xE0000000), Insn(0x06, 0, 0, 512),
+                      Insn(0x15, 0, 2, 0xE0000000), Insn(0x06, 0, 0, 65535),
                       Insn(0x06, 0, 0, 0), Insn(0x06, 0, 0, 0))
     program = Program(len(code), code)
     libc = ctypes.CDLL(None, use_errno=True)
@@ -124,7 +125,7 @@ class Capture:
         return self.sock.fileno()
 
     def recv(self):
-        data, address = self.sock.recvfrom(512)
+        data, address = self.sock.recvfrom(65535)
         # Do not mistake locally transmitted packets for ISP reception.
         return b'' if address[2] == socket.PACKET_OUTGOING else data
 
@@ -155,8 +156,13 @@ def write_results(prefix, records, summary):
     playlist = ['#EXTM3U']
     for row in rows:
         scheme = 'rtp' if row['kind'] == 'rtp-mpeg-ts' else 'udp'
-        playlist.extend([f"#EXTINF:-1,{row['group']}:{row['port']}",
-                         f"{scheme}://@{row['group']}:{row['port']}"])
+        for service in row.get('services') or [None]:
+            label = service['name'] if service else f"{row['group']}:{row['port']}"
+            label = ''.join(c for c in label if c.isprintable())
+            playlist.append(f'#EXTINF:-1,{label}')
+            if service:
+                playlist.append(f"#EXTVLCOPT:program={service['service_id']}")
+            playlist.append(f"{scheme}://@{row['group']}:{row['port']}")
     for suffix, content in (('.json', document), ('.m3u', '\n'.join(playlist) + '\n')):
         dest = Path(str(base) + suffix)
         temporary = Path(str(dest) + '.tmp')
@@ -168,6 +174,7 @@ def write_results(prefix, records, summary):
 def scan(args, blocks, index, capture, joiner=join, stopped=lambda: False):
     total = sum(hi - lo + 1 for lo, hi in blocks) * args.passes
     active, records = {}, {}
+    decoders = {}
     attempted = joined = expired = errors = 0
     started = time.monotonic()
     next_join = started
@@ -185,6 +192,9 @@ def scan(args, blocks, index, capture, joiner=join, stopped=lambda: False):
                     sock.close()
                     del active[group]
                     expired += 1
+                    next_join = max(next_join, now + args.cooldown)
+                    for key in [key for key in decoders if key[0] == group]:
+                        del decoders[key]
             if not exhausted and len(active) < args.concurrency and now >= next_join:
                 # Avoid overlapping membership windows across passes on tiny ranges.
                 if attempted and attempted % (total // args.passes) == 0 and active:
@@ -216,7 +226,8 @@ def scan(args, blocks, index, capture, joiner=join, stopped=lambda: False):
             if selector.select(timeout):
                 for _ in range(256):
                     try:
-                        packet = parse_packet(capture.recv())
+                        data = capture.recv()
+                        packet = parse_packet(data)
                     except BlockingIOError:
                         break
                     if packet is None or packet[0] not in active:
@@ -232,6 +243,13 @@ def scan(args, blocks, index, capture, joiner=join, stopped=lambda: False):
                     record['payload_bytes'] += size
                     if kind != 'udp':
                         record['kind'] = kind
+                        decoder = decoders.setdefault(key, ServiceNames())
+                        ihl = (data[0] & 15) * 4
+                        services = decoder.feed(data[ihl + 8:ihl + 8 + size])
+                        if services:
+                            previous = {s['service_id']: s for s in record.get('services', [])}
+                            previous.update({s['service_id']: s for s in services})
+                            record['services'] = [previous[k] for k in sorted(previous)]
             now = time.monotonic()
             summary = {'planned_windows': total, 'attempted_windows': attempted,
                        'joined_windows': joined, 'completed_windows': expired,
@@ -239,7 +257,8 @@ def scan(args, blocks, index, capture, joiner=join, stopped=lambda: False):
                        'stream_count': len(records), 'interrupted': bool(stopped()),
                        'ranges': args.ranges, 'interface': args.interface,
                        'wait_seconds': args.wait, 'concurrency': args.concurrency,
-                       'joins_per_second': args.rate, 'passes': args.passes}
+                       'joins_per_second': args.rate, 'passes': args.passes,
+                       'leave_cooldown_seconds': args.cooldown}
             if now - last_report >= 2:
                 speed = expired / max(now - started, .001)
                 eta = (total - expired) / speed if speed else None
@@ -268,9 +287,10 @@ def main(argv=None):
     parser.add_argument('-i', '--interface', required=True, help='IPTV interface (including VLAN interface if applicable)')
     parser.add_argument('-r', '--range', dest='ranges', action='append',
                         help='CIDR or inclusive FIRST-LAST; repeatable; default: full 224.0.0.0/4')
-    parser.add_argument('-c', '--concurrency', type=int, default=64)
-    parser.add_argument('--wait', type=float, default=1.5, help='seconds per joined group (default: 1.5)')
-    parser.add_argument('--rate', type=float, default=128, help='maximum group joins/second (default: 128)')
+    parser.add_argument('-c', '--concurrency', type=int, default=4, help='simultaneous groups, 1-4 (NOWTV limit)')
+    parser.add_argument('--wait', type=float, default=5, help='seconds per joined group (default: 5; includes SDT observation)')
+    parser.add_argument('--rate', type=float, default=4, help='maximum group joins/second (default: 4)')
+    parser.add_argument('--cooldown', type=float, default=2, help='pause new joins after leaving a group (seconds; default: 2)')
     parser.add_argument('--passes', type=int, default=1)
     parser.add_argument('-o', '--output', default='channels', help='output prefix; .json and .m3u will be replaced')
     parser.add_argument('--dry-run', action='store_true', help='show range size and ideal timing without joining or capturing')
@@ -281,11 +301,15 @@ def main(argv=None):
         if (args.concurrency < 1 or args.passes < 1 or not math.isfinite(args.wait)
                 or not math.isfinite(args.rate) or args.wait <= 0 or args.rate <= 0):
             raise ValueError('concurrency/passes must be positive integers; wait/rate must be finite and positive')
+        if args.concurrency > 4:
+            raise ValueError('NOWTV permits at most 4 concurrent groups; use -c 1 through -c 4')
+        if not math.isfinite(args.cooldown) or args.cooldown < 0:
+            raise ValueError('cooldown must be finite and nonnegative')
         blocks = ranges(args.ranges)
         count = sum(hi - lo + 1 for lo, hi in blocks)
         ideal = max(count / args.rate, count * args.wait / args.concurrency) * args.passes
         print(f'{count:,} distinct groups, {args.passes} pass(es); ideal lower estimate '
-              f'{ideal:.1f}s ({ideal / 3600:.2f}h), excluding ISP delays and retries', file=sys.stderr)
+              f'{ideal:.1f}s ({ideal / 3600:.2f}h), excluding leave cooldown, ISP delays and retries', file=sys.stderr)
         if args.dry_run:
             return 0
         if sys.platform != 'linux':
